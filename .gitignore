@@ -1,0 +1,8 @@
+logs/
+__pycache__/
+*.pyc
+.DS_Store
+output.log
+dashboard.html
+dashboard_integrated.html
+jpx_list.csv

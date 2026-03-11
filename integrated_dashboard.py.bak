@@ -1,0 +1,847 @@
+#!/usr/bin/env python3
+"""
+統合ダッシュボード v6 - 2画面構成
+画面1: セクター一覧（シンプル）+ ヒストリカルヒートマップ
+画面2: セクター詳細（RS推移チャート、センサー根拠、SNS投稿、個別株）
+"""
+
+import json, os, glob, warnings, datetime as dt
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import requests
+
+warnings.filterwarnings("ignore")
+
+# ── 設定 ──────────────────────────────────────
+TOPIX_ETF = "1306.T"
+SECTOR_ETFS = {
+    "食品":"1617.T","エネルギー資源":"1618.T","建設・資材":"1619.T",
+    "素材・化学":"1620.T","医薬品":"1621.T","自動車・輸送機":"1622.T",
+    "鉄鋼・非鉄":"1623.T","機械":"1624.T","電機・精密":"1625.T",
+    "情報通信・サービスその他":"1626.T","電気・ガス":"1627.T","運輸・物流":"1628.T",
+    "商社・卸売":"1629.T","小売":"1630.T","銀行":"1631.T",
+    "金融（除く銀行）":"1632.T","不動産":"1633.T",
+}
+SECTOR_NAMES = list(SECTOR_ETFS.keys())
+
+# 個別株: JSONから動的読み込み
+_stocks_json = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sector_stocks.json")
+if os.path.exists(_stocks_json):
+    with open(_stocks_json, 'r', encoding='utf-8') as _f:
+        SECTOR_STOCKS = {k: [(code, name) for code, name in v] for k, v in json.load(_f).items()}
+    print(f"銘柄リスト: {sum(len(v) for v in SECTOR_STOCKS.values())}銘柄")
+else:
+    SECTOR_STOCKS = {}
+
+SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK",
+    "SLACK_WEBHOOK_URL")
+LOG_DIR = os.path.expanduser("~/sector_rotation/logs")
+OUTPUT_HTML = os.path.expanduser("~/sector_rotation/dashboard_integrated.html")
+HEATMAP_DAYS = 90
+
+# ── データ取得 ──────────────────────────────────
+print("データ取得中...")
+end = dt.date.today() + dt.timedelta(days=1)
+start = end - dt.timedelta(days=HEATMAP_DAYS + 150)
+
+all_tickers = [TOPIX_ETF] + list(SECTOR_ETFS.values())
+for stocks in SECTOR_STOCKS.values():
+    all_tickers.extend([f"{code}.T" for code, _ in stocks])
+all_tickers = list(set(all_tickers))
+
+data = yf.download(all_tickers, start=start, end=end, auto_adjust=True, progress=False)
+close = data["Close"].dropna(how="all")
+volume = data["Volume"].dropna(how="all")
+
+# TOPIX欠損行を除外（ETFと個別株の取引日ずれ対策）
+if TOPIX_ETF in close.columns:
+    valid_dates = close[TOPIX_ETF].dropna().index
+    close = close.loc[valid_dates]
+    volume = volume.loc[volume.index.isin(valid_dates)]
+    print(f"TOPIX有効日数: {len(valid_dates)}")
+
+now_jst = dt.datetime.now(dt.timezone(dt.timedelta(hours=9)))
+today_str = now_jst.strftime('%Y-%m-%d')
+last_date_str = close.index[-1].strftime('%Y-%m-%d')
+if now_jst.hour < 16 and last_date_str == today_str and len(close) > 1:
+    close = close.iloc[:-1]
+    volume = volume.iloc[:-1]
+    print(f"取引時間中のため当日({today_str})除外")
+
+latest_date = close.index[-1].strftime('%Y-%m-%d')
+print(f"データ: {close.index[0].strftime('%Y-%m-%d')} ~ {latest_date} ({len(close)}日)")
+
+# TOPIX情報
+topix_price = float(close[TOPIX_ETF].iloc[-1]) if TOPIX_ETF in close.columns else 0
+topix_chg = (float(close[TOPIX_ETF].iloc[-1]) / float(close[TOPIX_ETF].iloc[-2]) - 1) * 100 if TOPIX_ETF in close.columns and len(close) > 1 else 0
+
+# ── センサーA/B/C: signal_*.jsonから ─────────────
+print("センサーA/B/C読み込み...")
+sig_logs = sorted(glob.glob(os.path.join(LOG_DIR, "signal_*.json")))
+sig_entries = []
+sig_date = "N/A"
+if sig_logs:
+    sig_date = os.path.basename(sig_logs[-1]).replace("signal_","").replace(".json","")
+    with open(sig_logs[-1], 'r') as f:
+        sig_raw = json.load(f)
+    if isinstance(sig_raw, list):
+        sig_entries = sig_raw
+
+b_signals = {}
+c_signals = {}
+a_signals = {}
+for entry in sig_entries:
+    name = entry.get("sector", "")
+    a_signals[name] = {"z": round(float(entry.get("A_z", 0)), 2)}
+    b_sig = ""
+    b_sig_raw = entry.get("B_signal", "-")
+    if "IN" in str(b_sig_raw): b_sig = "IN"
+    elif "OUT" in str(b_sig_raw): b_sig = "OUT"
+    b_signals[name] = {"z": round(float(entry.get("B_z", 0)), 2), "signal": b_sig}
+    c_sig = ""
+    c_sig_raw = entry.get("C_signal", "-")
+    if "UP" in str(c_sig_raw): c_sig = "UP"
+    elif "DOWN" in str(c_sig_raw): c_sig = "DOWN"
+    c_signals[name] = {"z": round(float(entry.get("C_z", 0)), 2), "signal": c_sig}
+
+# センサー推移（過去5日）
+sensor_history = {}
+for sl in sorted(glob.glob(os.path.join(LOG_DIR, "signal_*.json")))[-10:]:
+    try:
+        with open(sl, 'r') as f:
+            entries = json.load(f)
+        if isinstance(entries, list):
+            for entry in entries:
+                name = entry.get("sector", "")
+                if name not in sensor_history:
+                    sensor_history[name] = []
+                sensor_history[name].append({
+                    "date": entry.get("date", ""),
+                    "b_z": entry.get("B_z", 0),
+                    "c_z": entry.get("C_z", 0),
+                })
+    except Exception:
+        pass
+
+# ── センサーD: kabuline ──────────────────────────
+print("センサーD読み込み...")
+d_signals = {}
+kbl_date = "N/A"
+kbl_raw_posts = []
+kabuline_logs = sorted(glob.glob(os.path.join(LOG_DIR, "kabuline_*.json")))
+if kabuline_logs:
+    for kbl_path in reversed(kabuline_logs):
+        with open(kbl_path, 'r') as f:
+            kbl = json.load(f)
+        zscores = kbl.get("zscores", None)
+        sector_totals = kbl.get("sector_totals", {})
+        kbl_raw_posts = kbl.get("raw", [])
+        if zscores and isinstance(zscores, dict):
+            for name in SECTOR_NAMES:
+                val = zscores.get(name, {})
+                if isinstance(val, dict):
+                    d_signals[name] = {"z": round(val.get("z", 0), 2), "count": val.get("count", sector_totals.get(name, 0))}
+                elif isinstance(val, (int, float)):
+                    d_signals[name] = {"z": round(val, 2), "count": sector_totals.get(name, 0)}
+                else:
+                    d_signals[name] = {"z": 0, "count": sector_totals.get(name, 0)}
+            kbl_date = os.path.basename(kbl_path).replace("kabuline_","").replace(".json","")
+            break
+    else:
+        with open(kabuline_logs[-1], 'r') as f:
+            kbl = json.load(f)
+        sector_totals = kbl.get("sector_totals", {})
+        kbl_raw_posts = kbl.get("raw", [])
+        kbl_date = os.path.basename(kabuline_logs[-1]).replace("kabuline_","").replace(".json","")
+        for name in SECTOR_NAMES:
+            d_signals[name] = {"z": 0, "count": sector_totals.get(name, 0)}
+
+for name in SECTOR_NAMES:
+    if name not in d_signals:
+        d_signals[name] = {"z": 0, "count": 0}
+
+# SNS投稿をセクター別に整理
+sns_by_sector = {}
+for post in kbl_raw_posts:
+    sector = post.get("sector", "未分類")
+    if sector not in sns_by_sector:
+        sns_by_sector[sector] = []
+    sns_by_sector[sector].append(post)
+
+# ── RS計算 ───────────────────────────────────
+print("RS計算...")
+rs_daily = pd.DataFrame(index=close.index)
+for name, ticker in SECTOR_ETFS.items():
+    if ticker in close.columns and TOPIX_ETF in close.columns:
+        rs = close[ticker] / close[TOPIX_ETF]
+        rs_norm = (rs / rs.rolling(60).mean() - 1) * 100
+        rs_daily[name] = rs_norm
+
+# ── 総合スコア算出 ────────────────────────────────
+print("総合スコア算出...")
+sector_scores = []
+for name in SECTOR_NAMES:
+    a_z = a_signals.get(name, {}).get("z", 0)
+    b_z = b_signals.get(name, {}).get("z", 0)
+    b_sig = b_signals.get(name, {}).get("signal", "")
+    c_z = c_signals.get(name, {}).get("z", 0)
+    c_sig = c_signals.get(name, {}).get("signal", "")
+    d_z = d_signals.get(name, {}).get("z", 0)
+    d_count = d_signals.get(name, {}).get("count", 0)
+
+    bullish = 0; bearish = 0; sensors = {}
+    if a_z > 2: bullish += 1; sensors["A"] = "bull"
+    elif a_z < -2: bearish += 1; sensors["A"] = "bear"
+    else: sensors["A"] = "neutral"
+    if b_sig == "IN": bullish += 1; sensors["B"] = "bull"
+    elif b_sig == "OUT": bearish += 1; sensors["B"] = "bear"
+    else: sensors["B"] = "neutral"
+    if c_sig == "UP": bullish += 1; sensors["C"] = "bull"
+    elif c_sig == "DOWN": bearish += 1; sensors["C"] = "bear"
+    else: sensors["C"] = "neutral"
+    if d_z > 2: bullish += 1; sensors["D"] = "bull"
+    elif d_z < -2: bearish += 1; sensors["D"] = "bear"
+    else: sensors["D"] = "neutral"
+
+    max_bull_z = max(abs(b_z) if b_sig=="IN" else 0, abs(c_z) if c_sig=="UP" else 0, a_z if a_z>2 else 0, d_z if d_z>2 else 0)
+    max_bear_z = max(abs(b_z) if b_sig=="OUT" else 0, abs(c_z) if c_sig=="DOWN" else 0, abs(a_z) if a_z<-2 else 0, abs(d_z) if d_z<-2 else 0)
+    bull_score = bullish + (0.5 if max_bull_z > 3 else 0)
+    bear_score = bearish + (0.5 if max_bear_z > 3 else 0)
+
+    if bull_score >= 3: level = "HIGH"; direction = "IN"
+    elif bull_score >= 1.5: level = "MEDIUM"; direction = "IN"
+    elif bear_score >= 3: level = "HIGH"; direction = "OUT"
+    elif bear_score >= 1.5: level = "MEDIUM"; direction = "OUT"
+    else: level = "LOW"; direction = "NEUTRAL"
+
+    ticker = SECTOR_ETFS[name]
+    rs_5d = 0
+    if ticker in close.columns and TOPIX_ETF in close.columns:
+        rs = close[ticker] / close[TOPIX_ETF]
+        if len(rs) >= 6:
+            rs_5d = (float(rs.iloc[-1]) / float(rs.iloc[-6]) - 1) * 100
+
+    hist = sensor_history.get(name, [])
+
+    # 総合スコア (0-100)
+    raw_score = 50  # 中立=50
+    if b_sig == "IN": raw_score += min(abs(b_z) * 5, 20)
+    elif b_sig == "OUT": raw_score -= min(abs(b_z) * 5, 20)
+    if c_sig == "UP": raw_score += min(abs(c_z) * 4, 15)
+    elif c_sig == "DOWN": raw_score -= min(abs(c_z) * 4, 15)
+    if a_z > 0: raw_score += min(a_z * 3, 10)
+    elif a_z < 0: raw_score += max(a_z * 3, -10)
+    if d_z > 0: raw_score += min(d_z * 2, 5)
+    elif d_z < 0: raw_score += max(d_z * 2, -5)
+    score = max(0, min(100, round(raw_score)))
+
+    sector_scores.append({
+        "name": name, "level": level, "direction": direction,
+        "bullish": bullish, "bearish": bearish, "score": score,
+        "a_z": a_z, "b_z": b_z, "b_sig": b_sig,
+        "c_z": c_z, "c_sig": c_sig, "d_z": d_z, "d_count": d_count,
+        "sensors": sensors, "rs_5d": round(rs_5d, 2),
+        "b_z_hist": [h["b_z"] for h in hist],
+        "c_z_hist": [h["c_z"] for h in hist],
+    })
+
+def sort_key(s):
+    dir_order = {"IN": 0, "NEUTRAL": 1, "OUT": 2}
+    lev_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    return (dir_order.get(s["direction"], 1), lev_order.get(s["level"], 2), -s["rs_5d"])
+sector_scores.sort(key=sort_key)
+
+# ── 個別株データ ─────────────────────────────────
+print("個別株データ...")
+stock_data = {}
+for name in SECTOR_NAMES:
+    stocks = SECTOR_STOCKS.get(name, [])
+    stock_list = []
+    for code, company in stocks:
+        ticker = f"{code}.T"
+        if ticker not in close.columns: continue
+        try:
+            price = float(close[ticker].iloc[-1])
+            if pd.isna(price): continue
+            rs = close[ticker] / close[TOPIX_ETF]
+            rs_5d = (float(rs.iloc[-1]) / float(rs.iloc[-6]) - 1) * 100 if len(rs) >= 6 else 0
+            rs_20d = (float(rs.iloc[-1]) / float(rs.iloc[-21]) - 1) * 100 if len(rs) >= 21 else 0
+            vol_5 = float(volume[ticker].iloc[-5:].mean()) if ticker in volume.columns else 0
+            vol_60 = float(volume[ticker].iloc[-60:-5].mean()) if ticker in volume.columns and len(volume) > 60 else 1
+            vol_ratio = vol_5 / vol_60 if vol_60 > 0 else 1
+            # RS推移データ（日付付き）
+            rs_norm = (rs / rs.rolling(60).mean() - 1) * 100
+            rs_tail = rs_norm.tail(60).dropna()
+            rs_hist = [{"d": d.strftime("%m/%d"), "v": round(float(v), 2)} for d, v in rs_tail.items()]
+            stock_list.append({
+                "code": code, "name": company, "price": int(price),
+                "rs_5d": round(rs_5d, 2), "rs_20d": round(rs_20d, 2),
+                "vol_ratio": round(vol_ratio, 2), "rs_hist": rs_hist,
+            })
+        except Exception:
+            continue
+    stock_list.sort(key=lambda x: -x["rs_5d"])
+    stock_data[name] = stock_list
+
+# ── ヒストリカルヒートマップデータ ──────────────────
+print("ヒートマップデータ...")
+heatmap = rs_daily.tail(HEATMAP_DAYS).copy()
+hm_dates = [d.strftime("%m/%d") for d in heatmap.index]
+hm_sectors = list(heatmap.columns)
+hm_values = []
+for name in hm_sectors:
+    row = heatmap[name].fillna(0).tolist()
+    hm_values.append([round(v, 2) for v in row])
+
+# ── HTML生成 ──────────────────────────────────
+print("HTML生成...")
+
+def si(status):
+    """sensor icon"""
+    if status == "bull": return '<span style="color:#2e7d32;font-size:11px">●</span>'
+    if status == "bear": return '<span style="color:#c62828;font-size:11px">●</span>'
+    return '<span style="color:#bdbdbd;font-size:11px">●</span>'
+
+def badge(level, direction):
+    if direction == "IN":
+        c = "#2e7d32" if level == "HIGH" else "#558b2f"
+        bg = "#e8f5e9" if level == "HIGH" else "#f1f8e9"
+        return f'<span style="background:{bg};color:{c};padding:2px 10px;border-radius:12px;font-size:12px;font-weight:700">🟢 {level}</span>'
+    elif direction == "OUT":
+        c = "#c62828" if level == "HIGH" else "#ad1457"
+        bg = "#ffebee" if level == "HIGH" else "#fce4ec"
+        return f'<span style="background:{bg};color:{c};padding:2px 10px;border-radius:12px;font-size:12px;font-weight:700">🔴 {level}</span>'
+    return '<span style="background:#f5f5f5;color:#9e9e9e;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:700">⚪ LOW</span>'
+
+# サマリー
+in_sectors = [s for s in sector_scores if s["direction"]=="IN" and s["level"] in ("HIGH","MEDIUM")]
+out_sectors = [s for s in sector_scores if s["direction"]=="OUT" and s["level"] in ("HIGH","MEDIUM")]
+summary_in = "、".join([f'{s["name"]}({s["bullish"]}/4)' for s in in_sectors]) if in_sectors else "なし"
+summary_out = "、".join([f'{s["name"]}({s["bearish"]}/4)' for s in out_sectors]) if out_sectors else "なし"
+
+# セクター一覧カード
+cards_html = ""
+for i, s in enumerate(sector_scores):
+    rs_color = "color:#c62828" if s["rs_5d"] < 0 else "color:#2e7d32"
+    cards_html += f'''
+    <div class="card" onclick="showDetail({i})">
+        <div class="card-row">
+            <div class="card-left">
+                {badge(s["level"], s["direction"])}
+                <span class="sname">{s["name"]}</span>
+            </div>
+            <div class="card-right">
+                {si(s["sensors"]["A"])}{si(s["sensors"]["B"])}{si(s["sensors"]["C"])}{si(s["sensors"]["D"])}
+                <span style="background:#{'e8f5e9' if s['score']>=60 else 'ffebee' if s['score']<=40 else 'f5f5f5'};color:#{'2e7d32' if s['score']>=60 else 'c62828' if s['score']<=40 else '666'};padding:2px 6px;border-radius:8px;font-size:13px;font-weight:700;margin-left:4px">{s["score"]}</span>
+                <span style="{rs_color};font-weight:700;margin-left:4px;font-size:13px">{s["rs_5d"]:+.1f}%</span>
+                <span class="arrow">▶</span>
+            </div>
+        </div>
+    </div>'''
+
+# セクター詳細ページ（JavaScript側で切り替え）
+details_json = []
+for i, s in enumerate(sector_scores):
+    # RS推移チャートデータ
+    rs_chart_data = []
+    if s["name"] in rs_daily.columns:
+        rs_tail = rs_daily[s["name"]].tail(60).dropna()
+        rs_chart_data = [{"d": d.strftime("%m/%d"), "v": round(float(v), 2)} for d, v in rs_tail.items()]
+
+    # SNS投稿
+    sns_posts = sns_by_sector.get(s["name"], [])[:10]
+    sns_posts_data = [{"code": p.get("code",""), "count": p.get("count",0), "sector": p.get("sector","")} for p in sns_posts]
+
+    # 個別株
+    stocks = stock_data.get(s["name"], [])
+    stocks_data = []
+    for st in stocks:
+        stocks_data.append({
+            "code": st["code"], "name": st["name"], "price": st["price"],
+            "rs_5d": st["rs_5d"], "rs_20d": st["rs_20d"],
+            "vol_ratio": st["vol_ratio"], "rs_hist": st["rs_hist"],
+        })
+
+    details_json.append({
+        "name": s["name"], "level": s["level"], "direction": s["direction"],
+        "a_z": s["a_z"], "b_z": s["b_z"], "b_sig": s["b_sig"],
+        "c_z": s["c_z"], "c_sig": s["c_sig"], "d_z": s["d_z"], "d_count": s["d_count"],
+        "sensors": s["sensors"], "rs_5d": s["rs_5d"], "score": s.get("score", 50),
+        "b_z_hist": s["b_z_hist"], "c_z_hist": s["c_z_hist"],
+        "rs_chart": rs_chart_data, "sns_posts": sns_posts_data,
+        "stocks": stocks_data,
+    })
+
+html = f'''<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>セクターローテーション</title>
+<style>
+* {{ box-sizing:border-box; margin:0; padding:0; }}
+body {{ font-family:-apple-system,BlinkMacSystemFont,"Noto Sans JP",sans-serif; background:#f5f5f7; color:#1d1d1f; }}
+.page {{ display:none; max-width:900px; margin:0 auto; padding:16px; }}
+.page.active {{ display:block; }}
+.header {{ text-align:center; padding:16px 0 8px; }}
+.header h1 {{ font-size:20px; font-weight:700; }}
+.header .sub {{ font-size:13px; color:#86868b; margin-top:4px; }}
+.summary {{ background:#fff; border-radius:14px; padding:14px 18px; margin:10px 0; box-shadow:0 1px 4px rgba(0,0,0,.06); font-size:14px; line-height:1.7; }}
+.card {{ background:#fff; border-radius:12px; margin:6px 0; padding:12px 16px; box-shadow:0 1px 3px rgba(0,0,0,.05); cursor:pointer; transition:box-shadow .2s; }}
+.card:hover {{ box-shadow:0 2px 10px rgba(0,0,0,.1); }}
+.card-row {{ display:flex; justify-content:space-between; align-items:center; }}
+.card-left {{ display:flex; align-items:center; gap:8px; }}
+.card-right {{ display:flex; align-items:center; gap:4px; }}
+.sname {{ font-size:15px; font-weight:600; }}
+.arrow {{ color:#bbb; font-size:11px; margin-left:6px; }}
+.section-title {{ font-size:13px; color:#86868b; font-weight:600; margin:16px 0 8px; text-transform:uppercase; letter-spacing:1px; }}
+/* 詳細ページ */
+.back {{ display:inline-flex; align-items:center; gap:4px; color:#007aff; font-size:14px; cursor:pointer; padding:8px 0; }}
+.detail-header {{ padding:12px 0; }}
+.detail-header h2 {{ font-size:20px; font-weight:700; }}
+.sensor-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:12px 0; }}
+.sensor-card {{ background:#fff; border-radius:10px; padding:10px 14px; box-shadow:0 1px 3px rgba(0,0,0,.05); }}
+.sensor-card .label {{ font-size:11px; color:#86868b; }}
+.sensor-card .value {{ font-size:18px; font-weight:700; margin:4px 0; }}
+.sensor-card .desc {{ font-size:10px; color:#aaa; }}
+.sensor-card .status {{ font-size:12px; font-weight:600; }}
+.chart-box {{ background:#fff; border-radius:12px; padding:14px; margin:12px 0; box-shadow:0 1px 3px rgba(0,0,0,.05); }}
+.chart-box h3 {{ font-size:14px; font-weight:600; margin-bottom:8px; }}
+.chart-box .meta {{ font-size:10px; color:#aaa; margin-top:4px; }}
+canvas {{ width:100%!important; }}
+.stock-table {{ width:100%; border-collapse:collapse; font-size:13px; }}
+.stock-table th {{ text-align:left; padding:8px 6px; color:#86868b; font-weight:500; font-size:11px; border-bottom:1px solid #e0e0e0; }}
+.stock-table td {{ padding:8px 6px; border-bottom:1px solid #f5f5f5; }}
+.stock-table tr:hover {{ background:#fafafa; }}
+.sns-list {{ margin:8px 0; }}
+.sns-item {{ background:#f9f9f9; border-radius:8px; padding:8px 12px; margin:4px 0; font-size:13px; display:flex; justify-content:space-between; }}
+.guide {{ background:#fff; border-radius:14px; padding:16px 18px; margin:20px 0; box-shadow:0 1px 4px rgba(0,0,0,.06); font-size:12px; color:#86868b; line-height:1.8; }}
+.guide h3 {{ font-size:13px; color:#666; margin-bottom:6px; }}
+.footer {{ text-align:center; color:#bbb; font-size:11px; padding:16px 0; }}
+.hm-container {{ background:#fff; border-radius:12px; padding:14px; margin:12px 0; box-shadow:0 1px 3px rgba(0,0,0,.05); overflow-x:auto; }}
+</style>
+</head>
+<body>
+
+<!-- ===== 画面1: セクター一覧 ===== -->
+<div class="page active" id="page-list">
+<div class="header">
+    <h1>セクターローテーション</h1>
+    <div class="sub">{latest_date} | TOPIX {topix_price:,.0f}（{topix_chg:+.1f}%）| シグナル:{sig_date} SNS:{kbl_date}</div>
+</div>
+
+<div class="summary">
+    <span style="color:#2e7d32">🟢 資金流入: {summary_in}</span><br>
+    <span style="color:#c62828">🔴 資金流出: {summary_out}</span>
+    {'<div style="text-align:center;color:#86868b;margin-top:6px">☁️ 目立ったローテーションなし</div>' if summary_in=="なし" and summary_out=="なし" else ''}
+</div>
+
+<div class="section-title">セクター一覧（クリックで詳細）</div>
+{cards_html}
+
+<div class="section-title">ヒストリカル・セクターローテーション（過去{HEATMAP_DAYS}日）</div>
+<div class="hm-container">
+    <canvas id="heatmap-canvas" height="320"></canvas>
+    <div style="font-size:10px;color:#aaa;margin-top:4px">赤=TOPIXより強い / 青=弱い | 対TOPIX RS(60日平均からの乖離%)</div>
+</div>
+
+<div class="guide">
+    <h3>このダッシュボードの見方</h3>
+    <b>スコア(0-100)</b>: 50=中立。60以上=資金流入の兆候、40以下=資金流出の兆候。各センサーのz-scoreの強さに応じて加減算。<br>
+    <b>センサー●</b>: 左からA(売買代金) B(RS加速度) C(ベータ) D(SNS注目度)。<span style="color:#2e7d32">●緑</span>=強気 <span style="color:#c62828">●赤</span>=弱気 <span style="color:#bdbdbd">●灰</span>=平常。<br>
+    <b>判定基準</b>: HIGH=3センサー以上一致 / MED=2つ一致またはz極端値 / LOW=1つ以下。<br>
+    <b>更新</b>: 毎営業日16:30に自動実行(cron)。手動更新: <code>cd ~/sector_rotation && python3 integrated_dashboard.py</code>
+</div>
+<div class="footer">Generated: {dt.datetime.now().strftime("%Y-%m-%d %H:%M")} | sector_rotation system</div>
+</div>
+
+<!-- ===== 画面2: セクター詳細 ===== -->
+<div class="page" id="page-detail">
+<div class="back" onclick="showList()">◀ セクター一覧に戻る</div>
+<div class="detail-header">
+    <h2 id="detail-title"></h2>
+    <div id="detail-badge" style="margin-top:4px"></div>
+</div>
+
+<div class="sensor-grid" id="detail-sensors"></div>
+
+<div class="chart-box">
+    <h3>RS推移（対TOPIX、過去60日）</h3>
+    <canvas id="rs-chart" height="200"></canvas>
+    <div class="meta">RS = セクターETF価格 ÷ TOPIX ETF価格の60日平均からの乖離(%)。0%より上=TOPIXに勝っている。</div>
+</div>
+
+<div class="chart-box">
+    <h3>SNS注目銘柄（株ライン {kbl_date}）</h3>
+    <div id="detail-sns" class="sns-list"></div>
+    <div class="meta">出典: 株ライン(kabuline.jp) 話題株ランキング。件数=当日のSNS言及数。</div>
+</div>
+
+<div class="chart-box">
+    <h3>セクター内 個別株</h3>
+    <div style="font-size:10px;color:#aaa;margin-bottom:6px">RS=対TOPIXパフォーマンス | 出来高=直近5日平均÷過去60日平均 | 🔔=1.5倍超</div>
+    <table class="stock-table">
+        <tr><th>銘柄</th><th>株価</th><th>RS 5日</th><th>RS 20日</th><th>出来高</th></tr>
+        <tbody id="detail-stocks"></tbody>
+    </table>
+</div>
+
+<div class="chart-box">
+    <h3>センサー推移（B: RS加速度 / C: ベータ異常）</h3>
+    <canvas id="sensor-chart" height="180"></canvas>
+    <div class="meta">青線=B(RS加速度)のz-score / オレンジ線=C(ベータ異常)のz-score。点線=閾値(±1.5)。データ: signal_*.json 過去10日分</div>
+</div>
+
+<div class="chart-box">
+    <h3>個別株 RS推移</h3>
+    <canvas id="stock-chart" height="200"></canvas>
+    <div class="meta">セクター内上位5銘柄の対TOPIX RS推移（60日平均からの乖離%）</div>
+</div>
+
+<div class="guide">
+    <h3>算出根拠</h3>
+    <b>A 売買代金</b>: セクターETFの売買代金を60日間の平均・標準偏差で正規化したz-score。|z|>2で異常判定。ソース: sector_rotation.py ({sig_date})<br>
+    <b>B RS加速度</b>: 対TOPIX相対強度(RS)の短期(5日)モメンタムと長期(20日)モメンタムの差(加速度)を60日z-scoreで正規化。トレンド逆行条件(下落中に加速→IN、上昇中に減速→OUT)付き。ソース: sector_rotation.py ({sig_date})<br>
+    <b>C ベータ異常</b>: 短期β(20日)と長期β(60日)の差を60日z-scoreで正規化。短期βが急上昇→市場感応度が変化→資金流出入の兆候。ソース: sector_rotation.py ({sig_date})<br>
+    <b>D SNS注目度</b>: 株ライン(kabuline.jp)の話題株ランキングから業種別言及数を集計し、過去30日のz-scoreで正規化。z>2で注目急増。ソース: kabuline_scraper.py ({kbl_date})<br><br>
+    <b>総合スコア算出</b>: 基準値50に、B_IN→+z*5(上限20)、B_OUT→-z*5、C_UP→+z*4(上限15)、C_DOWN→-z*4、A→±z*3(上限10)、D→±z*2(上限5)を加減算し0-100にクリップ。<br>
+    <b>判定</b>: センサー4つの多数決。z>3の極端値は+0.5票加算。3票以上=HIGH、1.5票以上=MEDIUM、それ以下=LOW。
+</div>
+</div>
+
+<script>
+// データ
+const sectors = {json.dumps(details_json, ensure_ascii=False)};
+const hmDates = {json.dumps(hm_dates)};
+const hmSectors = {json.dumps(hm_sectors, ensure_ascii=False)};
+const hmValues = {json.dumps(hm_values)};
+
+// 画面切り替え
+function showList() {{
+    document.getElementById('page-list').classList.add('active');
+    document.getElementById('page-detail').classList.remove('active');
+    window.scrollTo(0, 0);
+}}
+function showDetail(idx) {{
+    document.getElementById('page-list').classList.remove('active');
+    document.getElementById('page-detail').classList.add('active');
+    window.scrollTo(0, 0);
+    renderDetail(sectors[idx]);
+}}
+
+function sIcon(st) {{
+    const c = st==='bull'?'#2e7d32':st==='bear'?'#c62828':'#bdbdbd';
+    return '<span style="color:'+c+';font-size:14px">●</span>';
+}}
+
+function renderDetail(s) {{
+    document.getElementById('detail-title').textContent = s.name;
+    const dir = s.direction==='IN'?'🟢':s.direction==='OUT'?'🔴':'⚪';
+    document.getElementById('detail-badge').innerHTML = dir+' '+s.level+' <span style="font-size:24px;font-weight:800;margin-left:8px">'+s.score+'</span><span style="font-size:12px;color:#86868b">/100</span> ('+s.bullish+'/4強気 '+s.bearish+'/4弱気)';
+
+    // センサーカード
+    const sg = document.getElementById('detail-sensors');
+    const sensors = [
+        {{key:'A', label:'売買代金', z:s.a_z, status:s.sensors.A, judge:s.a_z>2?'🟢異常増':s.a_z<-2?'🔴異常減':'➖平常'}},
+        {{key:'B', label:'RS加速度', z:s.b_z, status:s.sensors.B, judge:s.b_sig==='IN'?'🟢 ROTATION IN':s.b_sig==='OUT'?'🔴 ROTATION OUT':'➖平常'}},
+        {{key:'C', label:'ベータ異常', z:s.c_z, status:s.sensors.C, judge:s.c_sig==='UP'?'🟢感応度UP':s.c_sig==='DOWN'?'🔴感応度DOWN':'➖平常'}},
+        {{key:'D', label:'SNS注目度', z:s.d_z, status:s.sensors.D, judge:s.d_z>2?'🟢注目急増':s.d_z<-2?'🔴注目急減':'➖平常', extra:s.d_count+'件'}},
+    ];
+    sg.innerHTML = sensors.map(x => `
+        <div class="sensor-card">
+            <div class="label">${{sIcon(x.status)}} ${{x.key}} ${{x.label}}</div>
+            <div class="value">z=${{x.z}}</div>
+            <div class="status">${{x.judge}} ${{x.extra||''}}</div>
+        </div>
+    `).join('');
+
+    // RS推移チャート
+    drawLineChart('rs-chart', s.rs_chart, '#1a237e', 'RS(%)');
+
+    // SNS投稿
+    const snDiv = document.getElementById('detail-sns');
+    if (s.sns_posts.length > 0) {{
+        snDiv.innerHTML = s.sns_posts.map(p => `
+            <div class="sns-item">
+                <span><b>${{p.code}}</b> ${{p.sector}}</span>
+                <span>${{p.count}}件</span>
+            </div>
+        `).join('');
+    }} else {{
+        snDiv.innerHTML = '<div style="color:#aaa;font-size:13px">該当セクターのSNS投稿なし</div>';
+    }}
+
+    // 個別株テーブル
+    const tb = document.getElementById('detail-stocks');
+    tb.innerHTML = s.stocks.map(st => {{
+        const rc = st.rs_5d<0?'color:#c62828':'color:#2e7d32';
+        const vf = st.vol_ratio>1.5?' 🔔':'';
+        return `<tr>
+            <td><b>${{st.code}}</b> ${{st.name}}</td>
+            <td style="text-align:right">¥${{st.price.toLocaleString()}}</td>
+            <td style="text-align:right;${{rc}}">${{st.rs_5d>0?'+':''}}${{st.rs_5d.toFixed(1)}}%</td>
+            <td style="text-align:right">${{st.rs_20d>0?'+':''}}${{st.rs_20d.toFixed(1)}}%</td>
+            <td style="text-align:right">${{st.vol_ratio.toFixed(1)}}x${{vf}}</td>
+        </tr>`;
+    }}).join('');
+
+    // 個別株RS推移
+    drawMultiLineChart('stock-chart', s.stocks.slice(0, 5));
+    drawSensorChart(s);
+}}
+
+function drawLineChart(canvasId, data, color, label) {{
+    const canvas = document.getElementById(canvasId);
+    const ctx = canvas.getContext('2d');
+    const W = canvas.parentElement.offsetWidth - 28;
+    canvas.width = W; canvas.height = 200;
+    ctx.clearRect(0, 0, W, 200);
+    if (!data || data.length < 2) {{ ctx.fillStyle='#aaa'; ctx.fillText('データなし',W/2-20,100); return; }}
+
+    const vals = data.map(d => d.v);
+    const mn = Math.min(...vals, 0);
+    const mx = Math.max(...vals, 0);
+    const rng = mx - mn || 1;
+    const pad = {{t:20, b:30, l:40, r:10}};
+    const cw = W-pad.l-pad.r, ch = 200-pad.t-pad.b;
+
+    // ゼロライン
+    const zy = pad.t + ch - (0 - mn) / rng * ch;
+    ctx.strokeStyle = '#e0e0e0'; ctx.lineWidth = 1; ctx.setLineDash([4,4]);
+    ctx.beginPath(); ctx.moveTo(pad.l, zy); ctx.lineTo(W-pad.r, zy); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // データ線
+    ctx.strokeStyle = color; ctx.lineWidth = 2;
+    ctx.beginPath();
+    data.forEach((d, i) => {{
+        const x = pad.l + i / (data.length-1) * cw;
+        const y = pad.t + ch - (d.v - mn) / rng * ch;
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }});
+    ctx.stroke();
+
+    // 日付ラベル
+    ctx.fillStyle = '#aaa'; ctx.font = '10px sans-serif';
+    ctx.fillText(data[0].d, pad.l, 200-5);
+    ctx.fillText(data[Math.floor(data.length/2)].d, pad.l+cw/2-15, 200-5);
+    ctx.fillText(data[data.length-1].d, W-pad.r-30, 200-5);
+
+    // Y軸
+    ctx.fillText(mx.toFixed(1)+'%', 2, pad.t+10);
+    ctx.fillText('0%', 2, zy+4);
+    ctx.fillText(mn.toFixed(1)+'%', 2, pad.t+ch);
+
+    // 最新値ラベル
+    const lastV = vals[vals.length-1];
+    const lastY = pad.t + ch - (lastV - mn) / rng * ch;
+    ctx.fillStyle = color; ctx.font = 'bold 12px sans-serif';
+    ctx.fillText(lastV.toFixed(1)+'%', W-pad.r-45, lastY-6);
+}}
+
+function drawMultiLineChart(canvasId, stocks) {{
+    const canvas = document.getElementById(canvasId);
+    const ctx = canvas.getContext('2d');
+    const W = canvas.parentElement.offsetWidth - 28;
+    canvas.width = W; canvas.height = 200;
+    ctx.clearRect(0, 0, W, 200);
+    if (!stocks || stocks.length === 0) return;
+
+    const colors = ['#1a237e','#c62828','#2e7d32','#e65100','#6a1b9a'];
+    const pad = {{t:20, b:40, l:40, r:10}};
+    const cw = W-pad.l-pad.r, ch = 200-pad.t-pad.b;
+
+    let allVals = [];
+    stocks.forEach(st => {{ if(st.rs_hist) st.rs_hist.forEach(d => allVals.push(d.v)); }});
+    if (allVals.length === 0) return;
+    const mn = Math.min(...allVals, 0);
+    const mx = Math.max(...allVals, 0);
+    const rng = mx - mn || 1;
+
+    // ゼロライン
+    const zy = pad.t + ch - (0 - mn) / rng * ch;
+    ctx.strokeStyle = '#e0e0e0'; ctx.lineWidth = 1; ctx.setLineDash([4,4]);
+    ctx.beginPath(); ctx.moveTo(pad.l, zy); ctx.lineTo(W-pad.r, zy); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 各銘柄
+    stocks.forEach((st, si) => {{
+        if (!st.rs_hist || st.rs_hist.length < 2) return;
+        ctx.strokeStyle = colors[si % colors.length]; ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        st.rs_hist.forEach((d, i) => {{
+            const x = pad.l + i / (st.rs_hist.length-1) * cw;
+            const y = pad.t + ch - (d.v - mn) / rng * ch;
+            i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+        }});
+        ctx.stroke();
+        // ラベル
+        const last = st.rs_hist[st.rs_hist.length-1];
+        const ly = pad.t + ch - (last.v - mn) / rng * ch;
+        ctx.fillStyle = colors[si % colors.length]; ctx.font = '10px sans-serif';
+        ctx.fillText(st.code+' '+st.name.substring(0,4), W-pad.r-80, ly + (si*12-24));
+    }});
+
+    // 日付
+    const refHist = stocks[0].rs_hist;
+    if (refHist && refHist.length > 0) {{
+        ctx.fillStyle = '#aaa'; ctx.font = '10px sans-serif';
+        ctx.fillText(refHist[0].d, pad.l, 200-5);
+        ctx.fillText(refHist[refHist.length-1].d, W-pad.r-30, 200-5);
+    }}
+}}
+
+// ヒートマップ描画
+function drawSensorChart(s) {
+    const canvas = document.getElementById('sensor-chart');
+    const ctx = canvas.getContext('2d');
+    const W = canvas.parentElement.offsetWidth - 28;
+    canvas.width = W; canvas.height = 180;
+    ctx.clearRect(0, 0, W, 180);
+
+    const bHist = s.b_z_hist || [];
+    const cHist = s.c_z_hist || [];
+    if (bHist.length < 2 && cHist.length < 2) {
+        ctx.fillStyle='#aaa'; ctx.fillText('推移データなし（signal_*.jsonが1日分のみ）',20,90);
+        return;
+    }
+
+    const allVals = [...bHist, ...cHist];
+    const mn = Math.min(...allVals, -2);
+    const mx = Math.max(...allVals, 2);
+    const rng = mx - mn || 1;
+    const pad = {t:15, b:20, l:35, r:10};
+    const cw = W-pad.l-pad.r, ch = 180-pad.t-pad.b;
+
+    // 閾値線 ±1.5
+    [1.5, -1.5].forEach(th => {
+        const y = pad.t + ch - (th - mn) / rng * ch;
+        ctx.strokeStyle = '#e0e0e0'; ctx.lineWidth = 1; ctx.setLineDash([4,4]);
+        ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W-pad.r, y); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = '#bbb'; ctx.font = '10px sans-serif';
+        ctx.fillText(th>0?'+1.5':'-1.5', 2, y+4);
+    });
+
+    // ゼロライン
+    const zy = pad.t + ch - (0 - mn) / rng * ch;
+    ctx.strokeStyle = '#ddd'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(pad.l, zy); ctx.lineTo(W-pad.r, zy); ctx.stroke();
+
+    // B_z線
+    if (bHist.length >= 2) {
+        ctx.strokeStyle = '#1a237e'; ctx.lineWidth = 2;
+        ctx.beginPath();
+        bHist.forEach((v, i) => {
+            const x = pad.l + i / (bHist.length-1) * cw;
+            const y = pad.t + ch - (v - mn) / rng * ch;
+            i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+        ctx.fillStyle = '#1a237e'; ctx.font = 'bold 11px sans-serif';
+        const lastBy = pad.t + ch - (bHist[bHist.length-1] - mn) / rng * ch;
+        ctx.fillText('B:'+bHist[bHist.length-1].toFixed(1), W-pad.r-40, lastBy-6);
+    }
+
+    // C_z線
+    if (cHist.length >= 2) {
+        ctx.strokeStyle = '#e65100'; ctx.lineWidth = 2;
+        ctx.beginPath();
+        cHist.forEach((v, i) => {
+            const x = pad.l + i / (cHist.length-1) * cw;
+            const y = pad.t + ch - (v - mn) / rng * ch;
+            i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+        ctx.fillStyle = '#e65100'; ctx.font = 'bold 11px sans-serif';
+        const lastCy = pad.t + ch - (cHist[cHist.length-1] - mn) / rng * ch;
+        ctx.fillText('C:'+cHist[cHist.length-1].toFixed(1), W-pad.r-40, lastCy+14);
+    }
+}
+
+function drawHeatmap() {{
+    const canvas = document.getElementById('heatmap-canvas');
+    const ctx = canvas.getContext('2d');
+    const rows = hmSectors.length;
+    const cols = hmDates.length;
+    const pad = {{t:10, b:25, l:130, r:10}};
+    const W = Math.max(canvas.parentElement.offsetWidth - 28, pad.l + cols * 4 + pad.r);
+    const cellW = Math.max((W - pad.l - pad.r) / cols, 2);
+    const cellH = Math.max(280 / rows, 14);
+    canvas.width = W;
+    canvas.height = pad.t + rows * cellH + pad.b;
+
+    for (let r = 0; r < rows; r++) {{
+        // セクター名
+        ctx.fillStyle = '#333'; ctx.font = '11px sans-serif';
+        ctx.fillText(hmSectors[r], 4, pad.t + r * cellH + cellH/2 + 4);
+        for (let c = 0; c < cols; c++) {{
+            const v = hmValues[r][c];
+            const clamped = Math.max(-5, Math.min(5, v));
+            let color;
+            if (clamped >= 0) {{
+                const t = clamped / 5;
+                const r2 = Math.round(224 - t * (224-183));
+                const g2 = Math.round(224 - t * (224-28));
+                const b2 = Math.round(224 - t * (224-28));
+                color = `rgb(${{r2}},${{g2}},${{b2}})`;
+            }} else {{
+                const t = -clamped / 5;
+                const r2 = Math.round(224 - t * (224-26));
+                const g2 = Math.round(224 - t * (224-35));
+                const b2 = Math.round(224 - t * (224-126));
+                color = `rgb(${{r2}},${{g2}},${{b2}})`;
+            }}
+            ctx.fillStyle = color;
+            ctx.fillRect(pad.l + c * cellW, pad.t + r * cellH, cellW + 0.5, cellH - 1);
+        }}
+    }}
+    // 日付ラベル
+    ctx.fillStyle = '#aaa'; ctx.font = '10px sans-serif';
+    ctx.fillText(hmDates[0], pad.l, pad.t + rows * cellH + 15);
+    const mid = Math.floor(cols / 2);
+    ctx.fillText(hmDates[mid], pad.l + mid * cellW, pad.t + rows * cellH + 15);
+    ctx.fillText(hmDates[cols-1], pad.l + (cols-1) * cellW - 20, pad.t + rows * cellH + 15);
+}}
+
+// 初期化
+window.addEventListener('load', drawHeatmap);
+window.addEventListener('resize', drawHeatmap);
+</script>
+</body>
+</html>'''
+
+with open(OUTPUT_HTML, 'w', encoding='utf-8') as f:
+    f.write(html)
+print(f"✅ ダッシュボード: {OUTPUT_HTML}")
+
+# ── ログ保存 ──────────────────────────────────
+log_path = os.path.join(LOG_DIR, f"dashboard_{latest_date}.json")
+with open(log_path, 'w', encoding='utf-8') as f:
+    json.dump({"date": latest_date, "sectors": sector_scores}, f, ensure_ascii=False, indent=2, default=str)
+
+# ── Slack通知 ─────────────────────────────────
+slack_text = f"📊 {latest_date} セクターローテーション\nTOPIX {topix_price:,.0f}（{topix_chg:+.1f}%）\n\n🟢 資金流入: {summary_in}\n🔴 資金流出: {summary_out}"
+for s in sector_scores:
+    if s["level"] in ("HIGH", "MEDIUM"):
+        emoji = "🟢" if s["direction"] == "IN" else "🔴"
+        reasons = []
+        if s["b_sig"]: reasons.append(f"B:{s['b_sig']} z={s['b_z']}")
+        if s["c_sig"]: reasons.append(f"C:{s['c_sig']} z={s['c_z']}")
+        if s["a_z"] > 2 or s["a_z"] < -2: reasons.append(f"A:z={s['a_z']}")
+        if s["d_z"] > 2: reasons.append(f"D:SNS↑ z={s['d_z']}")
+        elif s["d_z"] < -2: reasons.append(f"D:SNS↓ z={s['d_z']}")
+        reason_str = " + ".join(reasons) if reasons else "複合"
+        slack_text += f"\n\n{emoji} {s['level']} {s['name']}（{reason_str}）"
+        for st in stock_data.get(s["name"], [])[:3]:
+            vol_flag = "🔔" if st["vol_ratio"] > 1.5 else ""
+            slack_text += f"\n  → {st['code']} {st['name']} ¥{st['price']:,} RS={st['rs_5d']:+.1f}% 出来高{st['vol_ratio']:.1f}x{vol_flag}"
+
+try:
+    resp = requests.post(SLACK_WEBHOOK, json={"text": slack_text}, timeout=10)
+    print(f"✅ Slack: {resp.status_code}")
+except Exception as e:
+    print(f"⚠️ Slack: {e}")
+
+print("=== 完了 ===")
