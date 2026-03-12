@@ -99,6 +99,8 @@ kbl_logs = sorted(glob.glob(os.path.join(LOG_DIR, "kabuline_*.json")))
 kbl_date = ""
 kbl_posts = []
 kbl_zscores = {}
+kbl_sentiment = {}
+kbl_stocks = []
 if kbl_logs:
     with open(kbl_logs[-1]) as f:
         kdata = json.load(f)
@@ -106,6 +108,8 @@ if kbl_logs:
     kbl_posts = kdata.get("raw",[])
     if kdata.get("zscores") and isinstance(kdata["zscores"], dict):
         kbl_zscores = kdata["zscores"]
+    kbl_sentiment = kdata.get("sector_sentiment", {})
+    kbl_stocks = kdata.get("stocks", [])  # 465銘柄個別データ
     print(f"  kabuline: {len(kbl_logs)}日分, 最新{os.path.basename(kbl_logs[-1])}")
 
 # sector_volume
@@ -245,42 +249,26 @@ for sec in sector_names_33:
         sl = sig_latest[mapped_17]
         # signalの値があればそちらを使う（より精度高い）
     
-    # === センサーD: SNS（kabuline sector_totalsから自前z-score計算） ===
+    # === センサーD: SNS（465銘柄個別データからbuy_pctがある銘柄のみ） ===
     d_z = 0
     d_count = 0
+    d_buy_pct = 50.0
     sns_for_sec = []
-    mapped_17 = map_17_to_33.get(sec, "")
-    # 過去30日分のsector_totalsを収集
-    d_series = []
-    for kp in kbl_logs[-30:]:
-        try:
-            with open(kp) as kf:
-                kd = json.load(kf)
-            st = kd.get("sector_totals", {})
-            val = st.get(mapped_17, 0)
-            if isinstance(val, (int, float)):
-                d_series.append(val)
-        except:
-            pass
-    if d_series:
-        d_count = d_series[-1] if d_series else 0
-        if len(d_series) >= 5:
-            import statistics
-            d_mean = statistics.mean(d_series[:-1]) if len(d_series) > 1 else 0
-            d_std = statistics.stdev(d_series[:-1]) if len(d_series) > 2 else 0
-            if d_std > 0:
-                d_z = (d_series[-1] - d_mean) / d_std
-    # SNS投稿（raw内の銘柄をセクターマッチ）
-    # 33業種名と17業種名の両方でマッチ
-    map_33_to_17 = {v:k for k,v in map_17_to_33.items()}
-    sec_17 = mapped_17  # この33業種に対応する17業種名
-    for p in kbl_posts:
-        p_sec = p.get("sector", "")
-        # 銘柄コードからセクターを引くパターンも試す
-        p_code = str(p.get("code", ""))
-        p_in_sector = any(p_code == c for c, n in sector_stocks.get(sec, []))
-        if p_sec == sec or p_sec == sec_17 or p_in_sector:
-            sns_for_sec.append(p)
+    # このセクターに属する銘柄のうちbuy_pctがある銘柄だけ抽出
+    sec_codes = set(c for c, n in sector_stocks.get(sec, []))
+    d_stocks_with_sentiment = []
+    for ks in kbl_stocks:
+        if ks.get("code","") in sec_codes and ks.get("buy_pct") is not None:
+            d_stocks_with_sentiment.append(ks)
+            sns_for_sec.append(ks)
+    # センチメントがある銘柄が1つ以上あればD値を計算
+    if d_stocks_with_sentiment:
+        d_count = sum(s.get("tweet_count", 0) for s in d_stocks_with_sentiment)
+        buy_vals = [s["buy_pct"] for s in d_stocks_with_sentiment]
+        d_buy_pct = sum(buy_vals) / len(buy_vals)
+        # 買率を-1〜+1に変換（50%=0, 70%=+0.4, 30%=-0.4）
+        d_z = (d_buy_pct - 50) / 25  # -2〜+2のレンジ
+        d_z = max(-5, min(5, d_z))  # クリップ
     
     # センサー状態
     sensors = {
@@ -439,16 +427,31 @@ for sec in sector_names_33:
                     sensor_history["c"].append(0)
             else:
                 sensor_history["c"].append(0)
+            # D: SNS（過去ログにstocksデータがないため今日以降蓄積）
+            sensor_history["d"].append(0)
 
     sectors_data.append({
         "name":sec,"score":round(score,1),"level":level,"direction":direction,
-        "a_z":round(a_z,1),"b_z":round(b_z,1),"c_z":round(c_z,1),"d_z":round(d_z,1),
+        "a_z":round(a_z,1),"b_z":round(b_z,1),"c_z":round(c_z,1),"d_z":round(d_z,1),"d_buy_pct":round(d_buy_pct,1),"d_buy_pct":round(d_buy_pct,1),
         "d_count":d_count,"b_sig":b_sig,"c_sig":c_sig,
         "rs_5d":round(rs_5d,1),"rs_20d":round(rs_20d,1),
         "sensors":sensors,"rs_chart":rs_chart,
         "sensor_history":sensor_history,
         "stocks":stock_list,"sns_posts":sns_for_sec
     })
+
+    # 個別株のD値: buy_pctがある銘柄のみ算出、なければ0
+    kbl_stock_map = {ks["code"]: ks for ks in kbl_stocks if ks.get("buy_pct") is not None}
+    for st in stock_list:
+        ks = kbl_stock_map.get(st["code"])
+        if ks:
+            st["d_z"] = round((ks["buy_pct"] - 50) / 25, 1)
+            st["d_count"] = ks.get("tweet_count", 0)
+            st["d_buy_pct"] = ks["buy_pct"]
+        else:
+            st["d_z"] = 0.0
+            st["d_count"] = 0
+            st["d_buy_pct"] = 0.0
 
 sectors_data.sort(key=lambda s: -s["score"])
 
@@ -580,7 +583,7 @@ table{{width:100%;border-collapse:collapse;font-size:12px;margin:8px 0}}
 th{{background:#f5f5f5;padding:6px 8px;text-align:left;font-weight:600;border-bottom:2px solid #e0e0e0}}
 td{{padding:6px 8px;border-bottom:1px solid #f0f0f0}}
 tr:hover{{background:#f8f8ff}}
-.hi{{background:#fff3e0}}
+.bullish{{background:#e8f5e9;color:#2e7d32}}.bearish{{background:#ffebee;color:#c62828}}
 .guide{{background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:14px;margin-top:16px;font-size:12px;color:#666}}
 .guide h3{{font-size:14px;color:#333;margin-bottom:8px}}
 .hm-wrap{{background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:14px;margin-bottom:16px;overflow-x:auto}}
@@ -677,28 +680,30 @@ for i, s in enumerate(sectors_data):
     
     # SNS投稿
     if s["sns_posts"]:
-        html += f'<h4>SNS注目銘柄（株ライン {kbl_date}）</h4>'
+        html += f'<h4>SNS注目銘柄（株ライン {kbl_date}） D={s["d_z"]:.1f}</h4>'
         for p in s["sns_posts"][:5]:
-            code = p.get("code","")
-            count = p.get("count",0)
+            pcode = p.get("code","")
+            pcount = p.get("tweet_count",0)
+            pbuy = p.get("buy_pct","")
             name_lookup = {c: n for c, n in sector_stocks.get(sec, [])}
-            sname = name_lookup.get(str(code), "")
-            html += f'<div style="padding:4px 0;font-size:12px"><a href="https://kabuline.com/stock/code/{code}/" target="_blank" class="sns-link">{code} {sname}</a> {count}件</div>'
+            sname = name_lookup.get(str(pcode), "")
+            buy_str = f" 買{pbuy}%" if pbuy else ""
+            html += f'<div style="padding:4px 0;font-size:12px"><a href="https://kabuline.com/stock/code/{pcode}/" target="_blank" class="sns-link">{pcode} {sname}</a> {pcount}件{buy_str}</div>'
     
     # 個別株テーブル（ABCD付き）
     html += """
   <h4>個別銘柄</h4>
   <table>
-  <tr><th>銘柄</th><th style="text-align:right">株価</th><th style="text-align:right">5日RS</th><th style="text-align:right">20日RS</th><th style="text-align:right">出来高</th><th style="text-align:right">A</th><th style="text-align:right">B</th><th style="text-align:right">C</th><th style="text-align:right">D</th></tr>
+  <tr><th>銘柄</th><th style="text-align:right">株価</th><th style="text-align:right">5日RS</th><th style="text-align:right">20日RS</th><th style="text-align:right">出来高<br><span style="font-weight:normal;font-size:10px">*=5日/60日&gt;1.5倍</span></th><th style="text-align:right">A</th><th style="text-align:right">B</th><th style="text-align:right">C</th><th style="text-align:right">D</th></tr>
 """
     for st in s["stocks"][:30]:
-        a_cls = ' class="hi"' if abs(st["a_z"])>1.5 else ""
-        b_cls = ' class="hi"' if abs(st["b_z"])>1.5 else ""
-        c_cls = ' class="hi"' if abs(st["c_z"])>0.5 else ""
-        d_cls = ' class="hi"' if st["d_count"]>5 else ""
+        a_cls = ' class="bullish"' if st["a_z"]>1.5 else (' class="bearish"' if st["a_z"]<-1.5 else "")
+        b_cls = ' class="bullish"' if st["b_z"]>1.5 else (' class="bearish"' if st["b_z"]<-1.5 else "")
+        c_cls = ' class="bullish"' if st["c_z"]>0.5 else (' class="bearish"' if st["c_z"]<-0.5 else "")
+        d_cls = ' class="bullish"' if st.get("d_z",0)>2 else (' class="bearish"' if st.get("d_z",0)<-2 else "")
         rs_c = "color:#c62828" if st["rs_5d"]<0 else "color:#2e7d32"
         vf = " *" if st["vol_ratio"]>1.5 else ""
-        html += f'<tr><td><b>{st["code"]}</b> {st["name"]}</td><td style="text-align:right">{st["price"]:,.0f}</td><td style="text-align:right;{rs_c}">{st["rs_5d"]:+.1f}%</td><td style="text-align:right">{st["rs_20d"]:+.1f}%</td><td style="text-align:right">{st["vol_ratio"]:.1f}x{vf}</td><td style="text-align:right"{a_cls}>{st["a_z"]:.1f}</td><td style="text-align:right"{b_cls}>{st["b_z"]:.1f}</td><td style="text-align:right"{c_cls}>{st["c_z"]:.1f}</td><td style="text-align:right"{d_cls}>{st["d_count"]}</td></tr>'
+        html += f'<tr><td><b>{st["code"]}</b> {st["name"]}</td><td style="text-align:right">{st["price"]:,.0f}</td><td style="text-align:right;{rs_c}">{st["rs_5d"]:+.1f}%</td><td style="text-align:right">{st["rs_20d"]:+.1f}%</td><td style="text-align:right">{st["vol_ratio"]:.1f}x{vf}</td><td style="text-align:right"{a_cls}>{st["a_z"]:.1f}</td><td style="text-align:right"{b_cls}>{st["b_z"]:.1f}</td><td style="text-align:right"{c_cls}>{st["c_z"]:.1f}</td><td style="text-align:right"{d_cls}>{st.get("d_z",0):.1f}{"<span style=\'font-size:9px;color:#888\'> ("+str(st.get("d_count",0))+"件)</span>" if st.get("d_count",0)>0 else ""}</td></tr>'
     
     html += "</table></div></div>"
 
@@ -824,24 +829,15 @@ function drawSensor(id, sectorIdx){
     if(cH&&cH.length>=2){cx.strokeStyle='#ffa726';cx.lineWidth=1.5;cx.beginPath();
     cH.forEach((v,i)=>{const x=p.l+i/(cH.length-1)*cw,y=p.t+ch-(v-mn)/rg*ch;i===0?cx.moveTo(x,y):cx.lineTo(x,y)});cx.stroke();
     cx.fillStyle='#ffa726';cx.font='bold 11px sans-serif';const cy2=p.t+ch-(cH[cH.length-1]-mn)/rg*ch;cx.fillText('C:'+cH[cH.length-1].toFixed(1),W-p.r-50,cy2+24)}
-    // D線（紫）
-    if(dH&&dH.length>=2){cx.strokeStyle='#ab47bc';cx.lineWidth=1.5;cx.beginPath();
-    dH.forEach((v,i)=>{const x=p.l+i/(dH.length-1)*cw,y=p.t+ch-(v-mn)/rg*ch;i===0?cx.moveTo(x,y):cx.lineTo(x,y)});cx.stroke();
-    cx.fillStyle='#ab47bc';cx.font='bold 11px sans-serif';const dy2=p.t+ch-(dH[dH.length-1]-mn)/rg*ch;cx.fillText('D:'+dH[dH.length-1].toFixed(1),W-p.r-50,dy2-4)}
-    const dx=W-p.r-20,dzy=p.t+ch-(0-mn)/rg*ch;
-    const dy=p.t+ch-(s.d_z-mn)/rg*ch;
-    cx.font='10px sans-serif';cx.fillText('D:'+s.d_z.toFixed(1),dx-25,dy-8);
-    // C現在値（橙マーカー）
-    const cy_=p.t+ch-(s.c_z-mn)/rg*ch;
-    cx.fillStyle='#ffa726';cx.beginPath();cx.arc(dx-40,cy_,5,0,Math.PI*2);cx.fill();
-    cx.font='10px sans-serif';cx.fillText('C:'+s.c_z.toFixed(1),dx-65,cy_-8);
+    const dx=W-p.r-20;
+
     // 日付ラベル
     cx.fillStyle='#999';cx.font='10px sans-serif';
     cx.fillText(dates[0],p.l,p.t+ch+20);
     if(dates.length>20)cx.fillText(dates[Math.floor(dates.length/2)],p.l+cw/2-15,p.t+ch+20);
     cx.fillText(dates[dates.length-1],W-p.r-30,p.t+ch+20);
     // 凡例
-    cx.fillText('緑=A(売買代金) 青=B(勢い) 橙●=C(感応度) 紫●=D(SNS)',p.l,p.t+ch+18+15);
+    cx.fillText('緑=A(売買代金) 青=B(勢い) 橙=C(感応度)',p.l,p.t+ch+18+15);
 }
 
 function drawHM(){
