@@ -4,5 +4,4 @@ __pycache__/
 .DS_Store
 output.log
 dashboard.html
-dashboard_integrated.html
 jpx_list.csv
